@@ -1,0 +1,56 @@
+.wp-core-ui  .wclsc-lookup-account-id {
+	margin-left:5px;
+	margin-right:5px;
+}
+
+.wclsc-spinner {
+	display: inline-block;
+	float:none;
+	position: relative;
+	top:3px;
+	margin-left:0;
+}
+
+.wclsc_error_log {
+	width:100%;
+	height:300px;
+}
+
+.lightspeed-order-details {
+	clear:both;
+	background: #EEE;
+	border-top:1px solid #DDD;
+	padding: 15px;
+}
+	.lightspeed-order-details .ls-order-summary {
+		float:left;
+		width:30%;
+	}
+		.lightspeed-order-details .ls-order-summary span {
+			float:right;
+			clear:right;
+		}
+	.lightspeed-order-details .ls-order-log {
+		float:right;
+		width:67%;
+	}
+		.lightspeed-order-details .ls-order-log-data,
+		.lightspeed-product-details .ls-product-log-data {
+			overflow-y:auto;
+			max-height: 200px;
+			font-family:monospace;
+			font-size: 12px;
+			padding-right: 10px;
+		}
+			.lightspeed-order-details .ls-order-log-data pre {
+				margin:5px 0 5px 10px;
+				padding:5px;
+				background: #F8F8F8;
+			}
+
+	.lightspeed-order-details .lightspeed-sale-object {
+		clear:both;
+		padding-top:15px;
+		margin-top:15px;
+		border-top:1px dotted #333;
+	}
