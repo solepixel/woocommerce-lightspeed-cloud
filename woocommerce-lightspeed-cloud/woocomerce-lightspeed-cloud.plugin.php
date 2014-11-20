@@ -6,6 +6,7 @@
  * Version: 1.1.0
  * Author: Brian DiChiara
  * Author URI: http://www.briandichiara.com
+ * License: GNU GPL v2.0
  */
 
 define( 'WCLSC_VERSION', '1.1.0' );
