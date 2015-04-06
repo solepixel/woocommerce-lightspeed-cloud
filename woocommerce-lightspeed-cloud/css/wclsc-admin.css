@@ -54,3 +54,44 @@
 		margin-top:15px;
 		border-top:1px dotted #333;
 	}
+
+.lightspeed-product-details {
+	padding: 13px;
+}
+
+.wclsc-sync {
+	float:right;
+	height: 0;
+	overflow: visible;
+	position: relative;
+}
+.wclsc-sync .sync-status {
+	background:#FFF;
+	border:1px solid #CCC;
+	padding:10px 15px;
+	max-width: 220px;
+}
+
+.wclsc-sync.syncing .sync-status {
+	background-image:url(../images/spinner.gif);
+	background-repeat: no-repeat;
+	background-position: 15px 12px;
+	padding-left:50px;
+	min-height: 50px;
+	margin-bottom:20px;
+}
+
+.wclsc-sync.syncing .wclsc-start-sync {
+	display:none;
+}
+.wclsc-sync .wclsc-stop-sync {
+	margin-top:5px;
+}
+
+.wclsc-start-sync {
+	margin-bottom: 5px;
+}
+
+.wclsc-sync-product {
+	float:right;
+}

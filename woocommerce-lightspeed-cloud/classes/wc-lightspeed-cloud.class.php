@@ -16,6 +16,18 @@ if( class_exists( 'Lightspeed_Cloud_API' ) ) return;
 class WC_Lightspeed_Cloud {
 
 	/**
+	 * Debug Mode
+	 * @var boolean
+	 */
+	var $debug = true;
+
+	/**
+	 * WooCommerce Debug Logger
+	 * @var object
+	 */
+	var $debug_logger;
+
+	/**
 	 * Instance of Lightspeed_Cloud_API
 	 * @var object
 	 */
@@ -34,6 +46,24 @@ class WC_Lightspeed_Cloud {
 	var $product_log = array();
 
 	/**
+	 * Flag for trashed post
+	 * @var [type]
+	 */
+	var $trashed;
+
+	/**
+	 * For performance tests
+	 * @var null
+	 */
+	var $start_time = NULL;
+
+	/**
+	 * For performance tests
+	 * @var null
+	 */
+	var $inventory_start_time = NULL;
+
+	/**
 	 * Class constructor
 	 */
 	function __construct(){
@@ -46,9 +76,19 @@ class WC_Lightspeed_Cloud {
 	 */
 	function initialize(){
 
+		global $woocommerce;
+		$this->debug_logger = class_exists( 'WC_Logger' ) ? new WC_Logger() : $woocommerce->logger();
+
 		// base plugin actions
 		add_action( 'init', array( $this, '_init' ) );
 
+		// Setup Cron
+		add_action( 'init', array( $this, 'setup_crons' ) );
+
+    	/**
+    	 * WooCommerce Create Customer
+    	 */
+    	add_action( 'woocommerce_created_customer', array( $this, 'auto_create_lightspeed_customer' ), 10, 3 );
 	}
 
 	/**
@@ -58,11 +98,75 @@ class WC_Lightspeed_Cloud {
 	 */
 	function _init(){
 
+		/**
+		 * Init Actions
+		 */
+
+		// Setup Integration with LightSpeed
+		add_action( 'admin_init', array( $this, 'setup_integration' ) );
+
+		// Administration actions
+		add_action( 'admin_init', array( $this, '_admin_init' ) );
+
+		// Store OAuth Code
+		add_action( 'admin_init', array( $this, 'store_oauth_code' ) );
+
+		/**
+		 * Ajax Actions
+		 */
+
 		// Admin Ajax function to lookup account id and test API
 		add_action( 'wp_ajax_wclsc_lookup_account_id', array( $this, 'get_lightspeed_account_id' ) );
 
-		// Admin Ajax function to clear logs
-		add_action( 'wp_ajax_wclsc_clear_error_log', array( $this, 'clear_error_log' ) );
+		// Admin Ajax to sync a single product
+		add_action( 'wp_ajax_wclsc_single_product_sync', array( $this, 'sync_woocommerce_product' ) );
+
+		// Admin Ajax to sync a single product
+		add_action( 'wp_ajax_wclsc_force_sync_product', array( $this, 'force_sync_woocommerce_product' ) );
+
+		// Admin Ajax to sync all products
+		add_action( 'wp_ajax_wclsc_all_product_sync', array( $this, 'start_woocommerce_product_sync' ) );
+
+		// Admin Ajax to sync product inventory
+		add_action( 'wp_ajax_wclsc_product_inventory_sync', array( $this, 'start_woocommerce_inventory_sync' ) );
+
+		// Admin Ajax to stop syncing products
+		add_action( 'wp_ajax_wclsc_abort_product_sync', array( $this, 'ajax_stop_sync' ) );
+
+		// Admin Ajax to get sync status
+		add_action( 'wp_ajax_wclsc_get_sync_status', array( $this, 'ajax_sync_status' ) );
+
+		// Trigger the cron during sync
+		add_action( 'wp_ajax_wclsc_trigger_cron', array( $this, 'trigger_cron' ) );
+
+		/**
+		 * Cron Actions
+		 */
+
+		# Ajax Triggered Cron Event
+		add_action( WCLSC_OPT_PREFIX . 'sync_products', array( $this, 'product_sync' ) );
+
+		# regularly scheduled Cron Event
+		add_action( WCLSC_OPT_PREFIX . 'recurring_sync_products', array( $this, 'start_woocommerce_product_sync' ) );
+
+		# Ajax Triggered Cron Event
+		add_action( WCLSC_OPT_PREFIX . 'sync_products_inventory', array( $this, 'product_inventory_sync' ) );
+
+		# regularly scheduled Cron Event
+		add_action( WCLSC_OPT_PREFIX . 'recurring_sync_product_inventory', array( $this, 'start_woocommerce_inventory_sync' ) );
+
+		# Ajax Triggered Cron Event
+		#add_action( WCLSC_OPT_PREFIX . 'sync_products_archived', array( $this, 'product_archived_sync' ) );
+
+		# regularly scheduled Cron Event
+		#add_action( WCLSC_OPT_PREFIX . 'recurring_sync_product_archived', array( $this, 'start_woocommerce_archived_sync' ) );
+
+		// Cron Schedules
+    	add_filter( 'cron_schedules', array( $this, 'cron_schedules' ) );
+
+		/**
+		 * Checkout Sync Actions
+		 */
 
 		// store customer information in LightSpeed
 		add_action( 'woocommerce_checkout_order_processed', array( $this, 'sync_lightspeed_customer' ), 10, 2 );
@@ -92,8 +196,18 @@ class WC_Lightspeed_Cloud {
 		// sync order status in LightSpeed
 		add_action( 'woocommerce_order_status_changed', array( $this, 'sync_order_status' ), 10, 3 );
 
-		// Administration actions
-		add_action( 'admin_init', array( $this, '_admin_init' ) );
+		/**
+		 * Misc Events
+		 */
+
+		add_action( 'woocommerce_order_refunded', array( $this, 'refund_order' ), 10, 2 );
+
+		/**
+		 * Admin Buttons
+		 */
+
+		add_action( 'woocommerce_product_options_stock_fields', array( $this, 'display_update_stock_button' ) );
+
 	}
 
 	/**
@@ -101,16 +215,29 @@ class WC_Lightspeed_Cloud {
 	 * @return void
 	 */
 	function _admin_init(){
+		if( isset( $_GET['wclsc-manual-sync'] ) && $_GET['wclsc-manual-sync'] == '1' ){
+			$this->product_sync();
+		}
+
 		add_action( 'admin_enqueue_scripts', array( $this, '_admin_resources' ) );
 		add_filter( 'woocommerce_get_settings_pages', array( $this, 'add_settings_page' ) );
 		add_filter( 'woocommerce_lightspeed_cloud_settings', array( $this, 'admin_tax_settings' ) );
-		add_filter( 'woocommerce_lightspeed_cloud_settings', array( $this, 'admin_log_settings' ) );
-
-		add_action( 'woocommerce_admin_field_wclsc_error_log', array( $this, 'admin_error_log' ) );
 
 		// Display information in WC Admin
 		add_action( 'woocommerce_admin_order_data_after_shipping_address', array( $this, 'display_lightspeed_debug_info' ) );
 		add_action( 'woocommerce_product_options_reviews', array( $this, 'display_lightspeed_product_info' ) );
+
+		add_action( 'woocommerce_get_settings_account', array( $this, 'woocommerce_account_settings' ) );
+	}
+
+	function store_oauth_code(){
+		if( isset( $_GET['wclsc-lightspeed-oauth-code'] ) ){
+			$code = sanitize_text_field( $_GET['wclsc-lightspeed-oauth-code'] );
+			update_option( WCLSC_OPT_PREFIX . 'oauth_code', $code );
+			echo '<script>window.close();</script>';
+			echo '<script>close();</script>';
+			exit();
+		}
 	}
 
 	/**
@@ -148,6 +275,102 @@ class WC_Lightspeed_Cloud {
 	function add_settings_page( $settings ){
 		$settings[] = include( WCLSC_PATH . '/classes/wc-settings-lightspeed.class.php' );
 		return $settings;
+	}
+
+	function woocommerce_account_settings( $settings ){
+		$new_settings = array();
+
+		foreach( $settings as $setting ){
+			if( $setting['type'] == 'sectionend' && $setting['id'] == 'account_registration_options' ){
+				$new_settings[] = array(
+					'desc'          => __( 'Automatically create a LightSpeed Customer', 'wclsc' ),
+					'id'            => WCLSC_OPT_PREFIX . 'woocommerce_create_customer',
+					'default'       => 'no',
+					'type'          => 'checkbox',
+					'autoload'      => false
+				);
+			}
+
+			$new_settings[] = $setting;
+		}
+
+		return $new_settings;
+	}
+
+	function setup_integration(){
+		// TODO
+	}
+
+	function cron_schedules( $schedules ){
+
+		$schedule_options = array();
+
+		$schedule_options['15_mins'] = array(
+			'display' => '15 Minutes',
+			'interval' => MINUTE_IN_SECONDS * 15
+		);
+
+		$schedule_options['30_mins'] = array(
+			'display' => '30 Minutes',
+			'interval' => MINUTE_IN_SECONDS * 30
+		);
+		$schedule_options['1_hour'] = array(
+			'display' => 'Hour',
+			'interval' => HOUR_IN_SECONDS
+		);
+		$schedule_options['2_hours'] = array(
+			'display' => '2 Hours',
+			'interval' => HOUR_IN_SECONDS * 2
+		);
+		$schedule_options['4_hours'] = array(
+			'display' => '4 Hours',
+			'interval' => HOUR_IN_SECONDS * 4
+		);
+		$schedule_options['6_hours'] = array(
+			'display' => '6 Hours',
+			'interval' => HOUR_IN_SECONDS * 6
+		);
+		$schedule_options['12_hours'] = array(
+			'display' => '12 Hours',
+			'interval' => HOUR_IN_SECONDS * 12
+		);
+
+		// Add each custom schedule into the cron job system.
+		foreach( $schedule_options as $schedule_key => $schedule ){
+			$schedules[ WCLSC_OPT_PREFIX . $schedule_key ] = array(
+				'interval' => $schedule['interval'],
+				'display' => __( 'Every ' . $schedule['display'] )
+			);
+		}
+
+		return $schedules;
+	}
+
+	function setup_crons(){
+		if( ! wp_next_scheduled( WCLSC_OPT_PREFIX . 'recurring_sync_products' ) )
+			wp_schedule_event( current_time( 'timestamp' ), 'wclsc_12_hours', WCLSC_OPT_PREFIX . 'recurring_sync_products' );
+
+		if( ! wp_next_scheduled( WCLSC_OPT_PREFIX . 'recurring_sync_product_inventory' ) )
+			wp_schedule_event( current_time( 'timestamp' ), 'wclsc_15_mins', WCLSC_OPT_PREFIX . 'recurring_sync_product_inventory' );
+
+		#if( ! wp_next_scheduled( WCLSC_OPT_PREFIX . 'recurring_sync_product_archived' ) )
+		#	wp_schedule_event( current_time( 'timestamp' ), 'wclsc_2_hours', WCLSC_OPT_PREFIX . 'recurring_sync_product_archived' );
+	}
+
+	function refund_order( $order_id, $refund_id ){
+		$order = wc_get_order( $order_id );
+		$refund = new WC_Order_Refund( $refund_id );
+
+		if( ! is_object( $refund ) )
+			return;
+
+		$sale_id = $this->lightspeed->get_sale_id( $order_id );
+
+		if( ! $sale_id )
+			return;
+
+		// TODO: handle refunds/restock inventory
+
 	}
 
 	/**
@@ -241,91 +464,23 @@ class WC_Lightspeed_Cloud {
 		return $lightspeed_cloud_settings;
 	}
 
-	/**
-	 * Add Log Settings to LightSpeed Cloud settings page
-	 * filter: woocommerce_lightspeed_cloud_settings
-	 * @param  array $lightspeed_cloud_settings Settings array
-	 * @return array $lightspeed_cloud_settings
-	 */
-	function admin_log_settings( $lightspeed_cloud_settings ){
-		$lightspeed_cloud_settings[] = array( # section start
-			'title' => __( 'LightSpeed Debug Log', 'wclsc' ),
-			'type' => 'title',
-			'desc' => '',
-			'id' => 'lightspeed_cloud_logs'
-		);
-
-		$lightspeed_cloud_settings[] = array(
-			'title' => __( 'Error Log', 'wclsc' ),
-			'desc' 		=> '',
-			'id' 		=> WCLSC_OPT_PREFIX . 'error_log',
-			'type' 		=> 'wclsc_error_log',
-			'autoload'  => false
-		);
-
-		$lightspeed_cloud_settings[] = array( 'type' => 'sectionend', 'id' => 'lightspeed_cloud_logs' );
-
-		return $lightspeed_cloud_settings;
-	}
-
-	/**
-	 * Hook for WooCommerce LightSpeed settings page field
-	 * action: woocommerce_admin_field_wclsc_error_log
-	 * @param  array $value Setting field array
-	 * @return void
-	 */
-	function admin_error_log( $value ){
-		$error_log = $this->lightspeed->get_error_log();
-
-		if( count( $error_log ) > 0 ){
-			$error_log = array_reverse( $error_log, true );
-			$error_log_display = '';
-			foreach( $error_log as $time => $error ){
-				if( strpos( $time, '|' ) !== false ){
-					list( $time, $uniqid ) = explode( '|', $time );
-				}
-				$error_log_display .= '[' . date( 'Y-m-d H:i:s', $time ) . ']  ' . $error . "\r\n";
-			}
-			echo '<textarea class="' . WCLSC_OPT_PREFIX . 'error_log" readonly="readonly">' . esc_textarea( $error_log_display ) . '</textarea>';
-			echo '<input type="button" class="button wclsc-clear-log" value="' . __( 'Clear Log', 'wclsc' ) . '" />';
-		} else {
-			echo '<p>' . __( 'No errors to report', 'wclsc' ) . '. :)' . '</p>';
-		}
-	}
-
-	/**
-	 * Clear the LightSpeed error logs
-	 * @return void
-	 */
-	function clear_error_log(){
-		$response = array(
-			'success' => true
-		);
-
-		if( ! current_user_can( 'manage_options' ) )
-			return;
-
-		delete_option( WCLSC_OPT_PREFIX . 'error_log' );
-
-		wp_send_json( $response );
-	}
-
 	function display_lightspeed_debug_info(){
 		global $post;
 		$order_id = $post->ID;
 
 		$sale_id = $this->lightspeed->get_sale_id( $order_id );
 
-		if( ! $sale_id )
-			return;
+		if( $sale_id ){
+			$payment_id = $this->lightspeed->get_payment_id( $order_id );
+			$sale = $this->lightspeed->get_sale( $sale_id );
+			$stored = '1';
 
-		$payment_id = $this->lightspeed->get_payment_id( $order_id );
-		$sale = $this->lightspeed->get_sale( $sale_id );
-		$stored = '1';
-
-		if( ! $payment_id ){
-			$payment_id = $this->get_payment_id_from_sale( $sale );
-			$stored = '0';
+			if( ! $payment_id ){
+				$payment_id = $this->get_payment_id_from_sale( $sale );
+				$stored = '0';
+			}
+		} else {
+			$stored = false;
 		}
 
 		$order_log = $this->get_order_log( $order_id );
@@ -343,7 +498,13 @@ class WC_Lightspeed_Cloud {
 
 		$item_id = $this->lightspeed->get_item_id( $product_id );
 
+		$item = $this->lightspeed->get_item( $item_id, true );
+
 		include( WCLSC_PATH . '/views/admin/lightspeed-product-details.php' );
+	}
+
+	function display_update_stock_button(){
+		#echo '<p class="form-field"><input type="button" class="button wclsc-update-item-inventory" value="' . __( 'Pull Inventory from LightSpeed', 'wclsc' ) . '" /></p>';
 	}
 
 	/**
@@ -369,9 +530,20 @@ class WC_Lightspeed_Cloud {
 	 * @return void
 	 */
 	function log_order_data( $order_id, $data ){
+		if( ! $this->debug )
+			return;
+
 		$this->get_order_log( $order_id );
 		$this->order_log[ current_time( 'timestamp' ) . '|' . uniqid() ] = $data;
 		update_post_meta( $order_id, WCLSC_META_PREFIX . 'order_log', $this->order_log );
+	}
+
+	function debug_log( $data, $label = '' ){
+
+		$debug = $label ? $label . ': ' . var_export( $data, true ) : var_export( $data, true );
+
+		$this->lightspeed->error = $debug;
+		$this->lightspeed->log_errors();
 	}
 
 	/**
@@ -399,6 +571,9 @@ class WC_Lightspeed_Cloud {
 	 * @return void
 	 */
 	function log_product_data( $product_id, $data ){
+		if( ! $this->debug )
+			return;
+
 		$this->get_product_log( $product_id );
 		$this->product_log[ $product_id ][ current_time( 'timestamp' ) . '|' . uniqid() ] = $data;
 		update_post_meta( $product_id, WCLSC_META_PREFIX . 'product_log', $this->product_log[ $product_id ] );
@@ -503,8 +678,8 @@ class WC_Lightspeed_Cloud {
 	 */
 	function setup_customer_data( $user_id, $user, $order_data ){
 		$customer_data = array(
-			'firstName' => $user->first_name,
-			'lastName' => $user->last_name,
+			'firstName' => html_entity_decode( $user->first_name ),
+			'lastName' => html_entity_decode( $user->last_name ),
 			'Contact' => array(
 				'Emails' => array(
 					'ContactEmail' => array(
@@ -522,7 +697,7 @@ class WC_Lightspeed_Cloud {
 		// add title if exists
 		$title = get_user_meta( $user_id, 'title', true );
 		if( $title )
-			$customer_data['title'] = $title;
+			$customer_data['title'] = html_entity_decode( $title );
 
 		// add phone if exists
 		$phone = get_user_meta( $user_id, 'phone', true );
@@ -561,6 +736,30 @@ class WC_Lightspeed_Cloud {
 		}
 
 		return (array) apply_filters( 'wclsc_customer_data', $customer_data, $user_id, $order_data );
+	}
+
+	function auto_create_lightspeed_customer( $customer_id, $new_customer_data, $password_generated ){
+		if( get_option( WCLSC_OPT_PREFIX . 'woocommerce_create_customer' ) != 'yes' )
+			return;
+
+		if( did_action( 'woocommerce_checkout_process' ) )
+			return;
+
+		$customer_data = array(
+			'Contact' => array(
+				'Emails' => array(
+					'ContactEmail' => array(
+						'address' => $new_customer_data['user_email'],
+						'useType' => 'Primary'
+					)
+				)
+			)
+		);
+
+		$customer = $this->lightspeed->create_customer( $customer_data );
+
+		if( $customer )
+			update_user_meta( $customer_id, WCLSC_META_PREFIX . 'customer_id', $customer->customer_id );
 	}
 
 	/**
@@ -694,7 +893,9 @@ class WC_Lightspeed_Cloud {
 		if( $item_id = $this->lightspeed->get_item_id( $product_id ) ){
 			// only update if valid item id
 			if( $this->lightspeed->get_item( $item_id ) ){
-				$item = $this->lightspeed->update_item( $item_id, $product_data );
+				if( $this->lightspeed->api_settings['sync_direction'] == 'wc2ls' ){
+					$item = $this->lightspeed->update_item( $item_id, $product_data );
+				}
 				return;
 			}
 
@@ -704,9 +905,11 @@ class WC_Lightspeed_Cloud {
 		if( $item = $this->lightspeed->lookup_item( $product_data ) ) {
 			$item_id = $item->itemID;
 
-			$this->lightspeed->update_item( $item_id, $product_data );
+			if( $this->lightspeed->api_settings['sync_direction'] == 'wc2ls' ){
+				$this->lightspeed->update_item( $item_id, $product_data );
 
-			$this->log_order_data( $order_id, 'Sync Product: Updated Item ID: ' . $item_id );
+				$this->log_order_data( $order_id, 'Sync Product: Updated Item ID: ' . $item_id );
+			}
 			update_post_meta( $product_id, WCLSC_META_PREFIX . 'item_id', $item_id );
 
 		// Create a new item in LightSpeed
@@ -719,6 +922,71 @@ class WC_Lightspeed_Cloud {
 			update_post_meta( $product_id, WCLSC_META_PREFIX . 'item_id', $item_id );
 		}
 
+	}
+
+	function sync_woocommerce_product(){
+		$response = array(
+			'success' => false,
+			'html' => __( 'Failure.', 'wclsc' )
+		);
+
+		if( isset( $_POST['product_id'] ) ){
+			$product_id = (int)$_POST['product_id'];
+			if( $product_id ){
+				$response['success'] = true;
+				$item_id = $this->lightspeed->get_item_id( $product_id );
+
+				$sync_button = '<a class="button wclsc-sync-product" href="#" data-item-id="' . $item_id . '">' . __( 'Sync with LightSpeed', 'wclsc' ) . '</a>';
+
+				if( ! $item_id ){
+					$sku_field = $this->lightspeed->api_settings['sku_field'];
+					if( $sku_field ){
+						$product = wc_get_product( $product_id );
+						$lookup = array( $sku_field => $product->get_sku() );
+						$ls_product = $this->lightspeed->lookup_item( $lookup );
+
+						if( $ls_product ){
+							$meta = update_post_meta( $product_id, WCLSC_META_PREFIX . 'item_id', $ls_product->itemID );
+							$response['success'] = true;
+							$response['html'] = __( 'LS Meta Stored successfully.', 'wclsc' );
+							$response['html'] .= $sync_button;
+						}
+					}
+				} else {
+					$response['html'] = __( 'Found matching LS Item ID: ', 'wclsc' ) . $item_id;
+					$response['html'] .= $sync_button;
+				}
+
+			} else {
+				$response['html'] = __( 'No Product ID.', 'wclsc' );
+			}
+		}
+
+		wp_send_json( $response );
+	}
+
+	function force_sync_woocommerce_product(){
+		$response = array(
+			'success' => false,
+			'html' => __( 'Failure.', 'wclsc' )
+		);
+
+		if( isset( $_POST['item_id'] ) ){
+
+			$item_id = (int) sanitize_text_field( $_POST['item_id'] );
+			$item = $this->lightspeed->get_item( $item_id, true );
+
+			if( $item && $post_id = $this->sync_lightspeed_item( $item ) ){
+				$response['success'] = true;
+				$response['html'] = __( 'Redirecting...', 'wclsc' );
+				if( $this->trashed ){
+					$response['redirect'] = admin_url() . 'edit.php?post_type=product&trashed=1&ids=' . $post_id;
+				}
+			}
+
+		}
+
+		wp_send_json( $response );
 	}
 
 	/**
@@ -747,8 +1015,11 @@ class WC_Lightspeed_Cloud {
 			)
 		);
 
-		if( $product->get_sku() )
-			$product_data['customSku'] = $product->get_sku();
+		if( $product->get_sku() ){
+			$sku_field = $this->lightspeed->api_settings['sku_field'];
+			if( $sku_field && $sku_field != 'systemSku' )
+				$product_data[ $sku_field ] = $product->get_sku();
+		}
 
 		/*
 
@@ -809,6 +1080,40 @@ class WC_Lightspeed_Cloud {
 		return $product_data;
 	}
 
+	function sync_product_category( $post_id, $category, $append = false ){
+		if( ! $category )
+			return false;
+
+		$method = $this->lightspeed->api_settings['sync_categories'];
+		if( ! $method )
+			return;
+
+		$taxonomy = $method == 'categories' ? 'product_cat' : 'product_tag';
+
+		$category = apply_filters( 'wclsc_lightspeed_category', $category );
+
+		wp_set_object_terms( $post_id, $category, $taxonomy, $append );
+	}
+
+	function sync_product_tags( $post_id, $tags ){
+		if( $tags && ! is_array( $tags ) )
+			$tags = array( $tags );
+
+		$method = $this->lightspeed->api_settings['sync_tags'];
+
+		if( ! $method )
+			return;
+
+		foreach( $tags as &$tag ){
+			$tag = apply_filters( 'wclsc_lightspeed_tag', $tag );
+			if( $method == 'categories' )
+				$tag = apply_filters( 'wclsc_lightspeed_category', $tag );
+		}
+
+		$taxonomy = $method == 'tags' ? 'product_tag' : 'product_cat';
+		wp_set_object_terms( $post_id, $tags, $taxonomy );
+	}
+
 	/**
 	 * Attach product photos to product
 	 * filter: wclsc_product_data
@@ -865,12 +1170,12 @@ class WC_Lightspeed_Cloud {
 		if( ! $customer_id )
 			$customer_id = $this->lightspeed->get_customer_id();
 
+		$tax_category = $this->get_tax_category_id( $order );
+
 		$sale_data = array(
-			'timeStamp' => date( 'c', strtotime( $order->order_date ) ),
 			'referenceNumber' => $order_id,
 			'referenceNumberSource' => __( 'WooCommerce', 'woocommerce' ),
 
-			'taxCategoryID' => $this->get_tax_category_id( $order ),
 			'employeeID' => $this->lightspeed->get_employee_id(),
 			'registerID' => $this->lightspeed->get_register_id(),
 			'customerID' => $customer_id,
@@ -880,6 +1185,16 @@ class WC_Lightspeed_Cloud {
 
 			'shopID' => $this->lightspeed->get_shop_id()
 		);
+
+		if( is_int( $tax_category ) && $tax_category ){
+			$sale_data['taxCategoryID'] = $tax_category;
+			#echo'TAX CATEGORY ID<pre>';var_dump($tax_category);echo'</pre>';
+			#exit();
+		} else {
+			$tax_data = $this->setup_tax_data( $order );
+			if( $tax_data )
+				$sale_data['TaxCategory'] = $tax_data;
+		}
 
 		return (array) apply_filters( 'wclsc_sale_data', $sale_data, $order );
 	}
@@ -893,6 +1208,8 @@ class WC_Lightspeed_Cloud {
 
 		$taxes = $order->get_items( 'tax' );
 
+		$tax_category = 0;
+
 		foreach( $taxes as $tax ){
 			$tax_category = $this->lightspeed->get_tax_category_id( $tax['name'], $tax['rate_id'] );
 			if( $tax_category )
@@ -903,6 +1220,28 @@ class WC_Lightspeed_Cloud {
 			return $tax_category;
 
 		return 0;
+	}
+
+	function setup_tax_data( $order ){
+		$tax_data = array(
+			'taxCategoryID' => 0
+		);
+
+		$taxes = $order->get_tax_totals();
+
+		if( count( $taxes) ){
+			foreach( $taxes as $name => $tax ){
+				if( ! isset( $tax_data['tax1Name'] ) ){
+					$tax_data['tax1Name'] = $tax->label;
+					$tax_data['tax1Rate'] = round( $tax->amount );
+				} elseif( ! isset( $tax_data['tax2Name'] ) ){
+					$tax_data['tax2Name'] = $tax->label;
+					$tax_data['tax2Rate'] = round( $tax->amount );
+				}
+			}
+		}
+
+		return $tax_data;
 	}
 
 	/**
@@ -920,16 +1259,15 @@ class WC_Lightspeed_Cloud {
 		$ship_to_data = array(
 			'customerID' => $customer_id,
 			'shipped' => false,
-			'timeStamp' => date( 'c', strtotime( $order->order_date ) )
 		);
 
 		if( $shipping_address && count( $shipping_address ) ){
 
 			$this->log_order_data( $order_id, 'Shipping Address: <pre>' . var_export( $shipping_address, true ) . '</pre>' );
 
-			$ship_to_data['firstName'] = $shipping_address['first_name'];
-			$ship_to_data['lastName'] = $shipping_address['last_name'];
-			$ship_to_data['company'] = $shipping_address['company'];
+			#$ship_to_data['firstName'] = $shipping_address['first_name'];
+			#$ship_to_data['lastName'] = $shipping_address['last_name'];
+			#$ship_to_data['company'] = $shipping_address['company'];
 
 			$ship_to_data['Contact'] = array(
 				'Addresses' => array(
@@ -978,8 +1316,7 @@ class WC_Lightspeed_Cloud {
 			);
 
 			$shipping_data = array(
-				'createTime' => date( 'c', strtotime( $order->order_date ) ),
-				'timeStamp' => date( 'c', strtotime( $order->order_date ) ),
+				#'createTime' => date( 'c', strtotime( $order->order_date ) ),
 				'unitQuantity' => 1,
 				'tax' => ( $shipping['tax'] > 0 ),
 				'taxClassID' => 0,
@@ -1014,8 +1351,7 @@ class WC_Lightspeed_Cloud {
 		$line_tax = floatval( round( $item['line_tax'], 2 ) );
 
 		$line_data = array(
-			'createTime' => date( 'c', strtotime( $order->order_date ) ),
-			'timeStamp' => date( 'c', strtotime( $order->order_date ) ),
+			#'createTime' => date( 'c', strtotime( $order->order_date ) ),
 			'unitQuantity' => $item['qty'],
 			'tax' => ( $line_tax > 0 ),
 
@@ -1113,6 +1449,7 @@ class WC_Lightspeed_Cloud {
 			$payment_id = $this->get_payment_id_from_sale( $sale );
 
 			if( $payment_id ){
+				$this->complete_sale( $sale );
 				$this->log_order_data( $order_id, 'Sync Payment: Created New Payment ID: ' . $payment_id );
 				update_post_meta( $order_id, WCLSC_META_PREFIX . 'payment_id', $payment_id );
 			} else {
@@ -1138,8 +1475,8 @@ class WC_Lightspeed_Cloud {
 		$payment_type_id = $this->get_payment_type_id( $payment_type );
 
 		$payment_data = array(
-			'amount' => $order->get_total(),
-			'createTime' => date( 'c', current_time( 'timestamp' ) ),
+			'amount' => round( $order->get_total(), 2 ),
+			#'createTime' => date( 'c', current_time( 'timestamp' ) ),
 			'CCCharge' => $this->setup_cccharge_data( $order, $sale_id )
 		);
 
@@ -1259,6 +1596,8 @@ class WC_Lightspeed_Cloud {
 		// Authorize.net support
 		if( isset( $_POST['ccnum'] ) ){
 			$credit_card_number = $_POST['ccnum'];
+		} elseif( isset( $_POST['authorize-net-cim-cc-number'] ) ){
+			$credit_card_number = $_POST['authorize-net-cim-cc-number'];
 		}
 
 		if( ! $credit_card_number ){
@@ -1281,6 +1620,8 @@ class WC_Lightspeed_Cloud {
 
 		if( isset( $_POST['expmonth'] ) && isset( $_POST['expyear'] ) ){
 			$exp = $_POST['expmonth'] . '-' . $_POST['expyear'];
+		} elseif( isset( $_POST['authorize-net-cim-cc-exp-month'] ) && isset( $_POST['authorize-net-cim-cc-exp-year'] ) ){
+			$exp = $_POST['authorize-net-cim-cc-exp-month'] . '-' . $_POST['authorize-net-cim-cc-exp-year'];
 		}
 
 		if( ! $exp ){
@@ -1300,6 +1641,7 @@ class WC_Lightspeed_Cloud {
 	 */
 	function get_auth_only( $order ){
 		$auth_only = NULL;
+		$sale_method = NULL;
 
 		$authorizenet_settings = get_option( 'woocommerce_authorize_settings' );
 
@@ -1309,9 +1651,21 @@ class WC_Lightspeed_Cloud {
 			$sale_method = $authorizenet_settings['salemode'];
 		}
 
-		if( $sale_method == 'AUTH_ONLY' ){
+		/*if( ! $sale_method ){
+			$authnetaim_settings = get_option( 'woocommerce_authorize_net_aim_settings' );
+
+			$sale_method = isset( $authnetaim_settings['transaction_type'] ) ? $authnetaim_settings['transaction_type'] : '';
+		}*/
+
+		if( ! $sale_method ){
+			$authnetcim_settings = get_option( 'woocommerce_authorize_net_cim_settings' );
+
+			$sale_method = isset( $authnetcim_settings['transaction_type'] ) ? $authnetcim_settings['transaction_type'] : '';
+		}
+
+		if( strtoupper( $sale_method ) == 'AUTH_ONLY' ){
 			$auth_only = true;
-		} elseif( $sale_method == 'AUTH_CAPTURE' ) {
+		} elseif( strtoupper( $sale_method ) == 'AUTH_CAPTURE' ) {
 			$auth_only = false;
 		}
 
@@ -1388,6 +1742,11 @@ class WC_Lightspeed_Cloud {
 			return;
 		}
 
+		if( ! $new_status ){
+			$this->log_order_data( $order_id, 'Sync Order Status (abort): No New Status.' );
+			return;
+		}
+
 		$sale_data = array(
 			'completed' => ( $new_status == 'completed' )
 		);
@@ -1403,6 +1762,14 @@ class WC_Lightspeed_Cloud {
 		$this->log_order_data( $order_id, 'Sync Order Status (Sale Object): <pre>' . var_export( $sale, true ) . '</pre>' );
 	}
 
+	function complete_sale( $sale ){
+		if( ! $sale )
+			return;
+
+		if( ! $sale->completed ){
+			$sale = $this->lightspeed->update_sale( $sale->saleID, array( 'completed' => true ) );
+		}
+	}
 
 	/**
 	 * Retrieve a valid salePaymentID from Sale Object
@@ -1460,5 +1827,643 @@ class WC_Lightspeed_Cloud {
 		}
 
 		return false;
+	}
+
+	function start_woocommerce_product_sync(){
+		$status = $this->get_sync_status();
+
+		$response = array(
+			'success' => true,
+			'html' => $status
+		);
+
+		# the last cron is still running. let's wait.
+		if( wp_next_scheduled( WCLSC_OPT_PREFIX . 'sync_products' ) ){
+			if( defined( 'DOING_AJAX' ) && DOING_AJAX )
+				wp_send_json( $response );
+			return;
+		}
+
+		$sync_status = array(
+			'started' => date( 'n/j/Y g:i a', current_time( 'timestamp' ) ),
+			'sync_amount' => $this->lightspeed->api_settings['sync_amount'],
+			'synced' => 0,
+			'trashed' => 0,
+			'not_synced' => 0
+		);
+
+		set_transient( WCLSC_META_PREFIX . 'sync_status', $sync_status );
+
+		// start the cron only if it hasn't already started...
+		if( ! wp_next_scheduled( WCLSC_OPT_PREFIX . 'sync_products' ) )
+			wp_schedule_single_event( current_time( 'timestamp' ), WCLSC_OPT_PREFIX . 'sync_products' );
+
+		if( defined( 'DOING_AJAX' ) && DOING_AJAX ){
+			wp_send_json( $response );
+		}
+	}
+
+	function start_woocommerce_inventory_sync(){
+
+		# the last cron is still running. let's wait.
+		if( wp_next_scheduled( WCLSC_OPT_PREFIX . 'sync_products_inventory' ) )
+			return;
+
+		$sync_status = array(
+			'started' => date( 'n/j/Y g:i a', current_time( 'timestamp' ) ),
+			'sync_amount' => $this->lightspeed->api_settings['sync_amount'],
+			'synced' => 0,
+			'not_synced' => 0
+		);
+
+		set_transient( WCLSC_META_PREFIX . 'inventory_sync_status', $sync_status );
+
+		// start the cron only if it hasn't already started...
+		if( ! wp_next_scheduled( WCLSC_OPT_PREFIX . 'sync_products_inventory' ) )
+			wp_schedule_single_event( current_time( 'timestamp' ), WCLSC_OPT_PREFIX . 'sync_products_inventory' );
+	}
+
+	function start_woocommerce_archived_sync(){
+		# the last cron is still running. let's wait.
+		if( wp_next_scheduled( WCLSC_OPT_PREFIX . 'sync_products_archived' ) )
+			return;
+
+		$sync_status = array(
+			'started' => date( 'n/j/Y g:i a', current_time( 'timestamp' ) ),
+			'sync_amount' => $this->lightspeed->api_settings['sync_amount'],
+			'archived' => 0
+		);
+
+		set_transient( WCLSC_META_PREFIX . 'archived_sync_status', $sync_status );
+
+		// start the cron only if it hasn't already started...
+		if( ! wp_next_scheduled( WCLSC_OPT_PREFIX . 'sync_products_archived' ) )
+			wp_schedule_single_event( current_time( 'timestamp' ), WCLSC_OPT_PREFIX . 'sync_products_archived' );
+	}
+
+	function product_sync(){
+		set_time_limit( HOUR_IN_SECONDS ); # 1 hour
+		if( ! defined( 'DOING_AJAX' ) || ! DOING_AJAX ){
+			error_reporting( E_ERROR | E_WARNING | E_PARSE );
+			ini_set( 'display_errors', '1' );
+		}
+
+		$sync_status = get_transient( WCLSC_META_PREFIX . 'sync_status' );
+
+		if( isset( $sync_status['is_running'] ) && $sync_status['is_running'] && ! isset( $sync_status['broke'] ) )
+			return;
+
+		if( ! isset( $sync_status['offset'] ) || ! $sync_status['offset'] )
+			$sync_status['offset'] = 0;
+
+		unset( $sync_status['scheduled'] );
+		unset( $sync_status['cancelled'] );
+
+		$sync_status['sync_amount'] = $this->lightspeed->api_settings['sync_amount'];
+
+		$items = $this->lightspeed->get_items( array(
+			'archived' => 1,
+			'limit' => $sync_status['sync_amount'],
+			'offset' => $sync_status['offset']
+		) );
+
+		if( $this->lightspeed->total_records )
+			$sync_status['total'] = $this->lightspeed->total_records;
+
+		$sync_status['is_running'] = true;
+
+		set_transient( WCLSC_META_PREFIX . 'sync_status', $sync_status );
+
+		$abort = false;
+
+		foreach( $items as $item ){
+			// lets make sure it doesn't fail and then just give up.
+			if( ! wp_next_scheduled( WCLSC_OPT_PREFIX . 'sync_products' ) )
+				wp_schedule_single_event( current_time( 'timestamp' ), WCLSC_OPT_PREFIX . 'sync_products' );
+
+			$this->start_time = microtime( true );
+
+			$sync_status['offset']++;
+			$sync_status['broke'] = true;
+
+			// let's make sure it progresses over troublesome records
+			set_transient( WCLSC_META_PREFIX . 'sync_status', $sync_status );
+
+			if( $post_id = $this->sync_lightspeed_item( $item ) ){
+
+				if( $this->trashed ){
+					$sync_status['trashed']++;
+				} else {
+					$sync_status['synced']++;
+				}
+
+				unset( $sync_status['broke'] );
+
+				set_transient( WCLSC_META_PREFIX . 'sync_status', $sync_status );
+
+				$abort = get_transient( WCLSC_META_PREFIX . 'abort' );
+
+				if( $abort ){
+					delete_transient( WCLSC_META_PREFIX . 'abort' );
+					break;
+				}
+			} else {
+				$sync_status['not_synced']++;
+			}
+		}
+
+		unset( $sync_status['is_running'] );
+		$sync_status['execution_time'] = round( microtime( true ) - $this->start_time, 3 ) . ' seconds.';
+
+		if( $sync_status['offset'] >= $sync_status['total'] ){
+			$sync_status['completed'] = date( 'n/j/Y g:i a', current_time( 'timestamp' ) );
+			wp_clear_scheduled_hook( WCLSC_OPT_PREFIX . 'sync_products' );
+			delete_transient( WCLSC_META_PREFIX . 'abort' );
+
+			$this->debug_logger->add( 'wclsc', 'PRODUCT SYNC:' . "\r\n" . var_export( $sync_status, true ) );
+		}
+
+		if( ( ! isset( $sync_status['completed'] ) || ! $sync_status['completed'] ) && ! $abort ){
+			wp_clear_scheduled_hook( WCLSC_OPT_PREFIX . 'sync_products' );
+			if( ! wp_next_scheduled( WCLSC_OPT_PREFIX . 'sync_products' ) )
+				wp_schedule_single_event( current_time( 'timestamp' ), WCLSC_OPT_PREFIX . 'sync_products' );
+			$sync_status['scheduled'] = true;
+		}
+
+		set_transient( WCLSC_META_PREFIX . 'sync_status', $sync_status );
+
+		#do_action( 'wclsc_product_sync' );
+	}
+
+	function product_inventory_sync(){
+		set_time_limit( HOUR_IN_SECONDS ); # 1 hour
+		if( ! defined( 'DOING_AJAX' ) || ! DOING_AJAX ){
+			error_reporting( E_ERROR | E_WARNING | E_PARSE );
+			ini_set( 'display_errors', '1' );
+		}
+
+		$sync_status = get_transient( WCLSC_META_PREFIX . 'inventory_sync_status' );
+
+		if( isset( $sync_status['is_running'] ) && $sync_status['is_running'] && ! isset( $sync_status['broke'] ) )
+			return;
+
+		if( ! isset( $sync_status['offset'] ) || ! $sync_status['offset'] )
+			$sync_status['offset'] = 0;
+
+		unset( $sync_status['scheduled'] );
+		unset( $sync_status['cancelled'] );
+
+		$sync_status['sync_amount'] = $this->lightspeed->api_settings['sync_amount'];
+
+		$items = $this->lightspeed->get_items( array(
+			'limit' => $this->lightspeed->api_settings['sync_amount'],
+			'offset' => $sync_status['offset']
+		), 'ItemShops' );
+
+		if( $this->lightspeed->total_records )
+			$sync_status['total'] = $this->lightspeed->total_records;
+
+		$sync_status['is_running'] = true;
+
+		set_transient( WCLSC_META_PREFIX . 'inventory_sync_status', $sync_status );
+
+		$abort = false;
+
+		foreach( $items as $item ){
+			$this->inventory_start_time = microtime( true );
+
+			$sync_status['offset']++;
+			$sync_status['broke'] = true;
+
+			set_transient( WCLSC_META_PREFIX . 'inventory_sync_status', $sync_status );
+
+			if( $post_id = $this->sync_lightspeed_item_inventory( $item ) ){
+
+				$sync_status['synced']++;
+				unset( $sync_status['broke'] );
+
+				set_transient( WCLSC_META_PREFIX . 'inventory_sync_status', $sync_status );
+
+				$abort = get_transient( WCLSC_META_PREFIX . 'inventory_abort' );
+
+				if( $abort ){
+					delete_transient( WCLSC_META_PREFIX . 'inventory_abort' );
+					break;
+				}
+			} else {
+				$sync_status['not_synced']++;
+			}
+		}
+
+		unset( $sync_status['is_running'] );
+		$sync_status['execution_time'] = round( microtime( true ) - $this->inventory_start_time, 3 ) . ' seconds.';
+
+		# Are we done yet?
+		if( $sync_status['offset'] >= $sync_status['total'] ){
+			$sync_status['completed'] = date( 'n/j/Y g:i a', current_time( 'timestamp' ) );
+			wp_clear_scheduled_hook( WCLSC_OPT_PREFIX . 'sync_products_inventory' );
+			delete_transient( WCLSC_META_PREFIX . 'inventory_abort' );
+
+			$this->debug_logger->add( 'wclsc', 'INVENTORY SYNC:' . "\r\n" . var_export( $sync_status, true ) );
+		}
+
+		if( ( ! isset( $sync_status['completed'] ) || ! $sync_status['completed'] ) && ! $abort ){
+			wp_clear_scheduled_hook( WCLSC_OPT_PREFIX . 'sync_products_inventory' );
+
+			if( ! wp_next_scheduled( WCLSC_OPT_PREFIX . 'sync_products_inventory' ) )
+				wp_schedule_single_event( current_time( 'timestamp' ), WCLSC_OPT_PREFIX . 'sync_products_inventory' );
+
+			$sync_status['scheduled'] = true;
+		}
+
+		set_transient( WCLSC_META_PREFIX . 'inventory_sync_status', $sync_status );
+
+		#do_action( 'wclsc_product_inventory_sync' );
+	}
+
+	function product_archived_sync(){
+		set_time_limit( HOUR_IN_SECONDS ); # 1 hour
+		if( ! defined( 'DOING_AJAX' ) || ! DOING_AJAX ){
+			error_reporting( E_ERROR | E_WARNING | E_PARSE );
+			ini_set( 'display_errors', '1' );
+		}
+
+		$sync_status = get_transient( WCLSC_META_PREFIX . 'archived_sync_status' );
+
+		if( isset( $sync_status['is_running'] ) && $sync_status['is_running'] )
+			return;
+
+		if( ! isset( $sync_status['offset'] ) || ! $sync_status['offset'] )
+			$sync_status['offset'] = 0;
+
+		unset( $sync_status['scheduled'] );
+		unset( $sync_status['cancelled'] );
+
+		$sync_status['sync_amount'] = $this->lightspeed->api_settings['sync_amount'];
+
+		$items = $this->lightspeed->get_items( array(
+			'archived' => 'only',
+			'limit' => $this->lightspeed->api_settings['sync_amount'],
+			'offset' => $sync_status['offset']
+		), NULL );
+
+		if( $this->lightspeed->total_records )
+			$sync_status['total'] = $this->lightspeed->total_records;
+
+		$sync_status['is_running'] = true;
+
+		set_transient( WCLSC_META_PREFIX . 'archived_sync_status', $sync_status );
+
+		#$abort = false;
+
+		foreach( $items as $item ){
+			#$this->start_time = microtime( true );
+
+			$sync_status['offset']++;
+
+			set_transient( WCLSC_META_PREFIX . 'archived_sync_status', $sync_status );
+
+			if( $this->sync_archived_lightspeed_item( $item ) )
+				$sync_status['archived']++;
+
+			#$abort = get_transient( WCLSC_META_PREFIX . 'archived_abort' );
+
+			#if( $abort ){
+			#	delete_transient( WCLSC_META_PREFIX . 'archived_abort' );
+			#	break;
+			#}
+		}
+
+		unset( $sync_status['is_running'] );
+		#$sync_status['execution_time'] = round( microtime( true ) - $this->start_time, 3 ) . ' seconds.';
+
+		if( $sync_status['offset'] >= $sync_status['total'] ){
+			$sync_status['completed'] = date( 'n/j/Y g:i a', current_time( 'timestamp' ) );
+			wp_clear_scheduled_hook( WCLSC_OPT_PREFIX . 'archived_sync_status' );
+			delete_transient( WCLSC_META_PREFIX . 'archived_abort' );
+
+			$this->debug_logger->add( 'wclsc', 'ARCHIVE SYNC:' . "\r\n" . var_export( $sync_status, true ) );
+		}
+
+		if( ( ! isset( $sync_status['completed'] ) || ! $sync_status['completed'] ) && ! $abort ){
+			wp_clear_scheduled_hook( WCLSC_OPT_PREFIX . 'sync_products_archived' );
+
+			if( ! wp_next_scheduled( WCLSC_OPT_PREFIX . 'sync_products_archived' ) )
+				wp_schedule_single_event( current_time( 'timestamp' ), WCLSC_OPT_PREFIX . 'sync_products_archived' );
+
+			$sync_status['scheduled'] = true;
+		}
+
+		set_transient( WCLSC_META_PREFIX . 'archived_sync_status', $sync_status );
+
+		#do_action( 'wclsc_product_archived_sync' );
+	}
+
+	function sync_lightspeed_item( $item ){
+		if( ! is_object( $item ) )
+			return false;
+
+		if( ! $this->start_time )
+			$this->start_time = microtime( true );
+
+		# check to see if a product exists with itemID meta
+		$post_id = $this->lightspeed->lookup_product_by_item_id( $item->itemID );
+
+		$sku_field = $this->lightspeed->api_settings['sku_field'];
+
+		# check to see if a product exists with SKU meta
+		if( ! $post_id && $sku_field && isset( $item->$sku_field ) && $item->$sku_field )
+			$post_id = $this->lightspeed->lookup_product_by_sku( $item->$sku_field );
+
+		# Trash the post if it's archived
+		if( $item->archived && $item->archived === 'true' ){
+			if( $post_id ){
+				wp_trash_post( $post_id );
+				$this->trashed = true;
+			}
+
+			return $post_id;
+		}
+
+		# create the product
+		if( ! $post_id ){
+			global $current_user;
+			get_currentuserinfo();
+
+			$new_product = array(
+				'post_author' => $current_user->ID,
+				'post_content' => '', // long description
+				'post_status' => 'publish',
+				'post_title' => $item->description,
+				'post_type' => 'product'
+			);
+
+			# Create product
+			$post_id = wp_insert_post( $new_product, $wp_error );
+		}
+
+		if( ! $post_id )
+			return false;
+
+		# add defaults if not already a value
+		if( ! get_post_meta( $post_id, '_visibility', true ) )
+			update_post_meta( $post_id, '_visibility', 'visible' );
+		if( ! get_post_meta( $post_id, '_virtual', true ) )
+			update_post_meta( $post_id, '_virtual', 'no' );
+		if( ! get_post_meta( $post_id, '_downloadable', true ) )
+			update_post_meta( $post_id, '_downloadable', 'no' );
+
+		# update product title, long description, and short description
+		$updated_product = array(
+			'ID' => $post_id
+		);
+
+		if( $item->description )
+			$updated_product['post_title'] = $item->description;
+
+		# update weight, width, height, and length
+		$ecomm_data = $this->lightspeed->get_ecommerce_data( $item );
+
+		if( $ecomm_data ){
+
+			if( $ecomm_data['longDescription'] )
+				$updated_product['post_content'] = $ecomm_data['longDescription'];
+			if( $ecomm_data['shortDescription'] )
+				$updated_product['post_excerpt'] = $ecomm_data['shortDescription'];
+
+			if( $ecomm_data['weight'] > 0 )
+				update_post_meta( $post_id, '_weight', $ecomm_data['weight'] );
+			if( $ecomm_data['width'] > 0 )
+				update_post_meta( $post_id, '_width', $ecomm_data['width'] );
+			if( $ecomm_data['height'] > 0 )
+				update_post_meta( $post_id, '_height', $ecomm_data['height'] );
+			if( $ecomm_data['length'] > 0 )
+				update_post_meta( $post_id, '_length', $ecomm_data['length'] );
+		}
+
+		# set sku and itemID meta
+		update_post_meta( $post_id, WCLSC_META_PREFIX . 'item_id', $item->itemID );
+
+		if( $sku_field && isset( $item->$sku_field ) && $item->$sku_field )
+			update_post_meta( $post_id, '_sku', $item->$sku_field );
+
+		# update regular price and sale price
+		if( $price = $this->lightspeed->get_item_price( $item ) ){
+			update_post_meta( $post_id, '_regular_price', $price );
+			update_post_meta( $post_id, '_price', $price );
+		}
+
+		# update QOH only on force product sync
+		#if( defined( 'DOING_AJAX' ) && DOING_AJAX )
+			$this->sync_qoh( $item, $post_id );
+
+		# tax
+		if( $item->tax )
+			update_post_meta( $post_id, '_tax_status', 'taxable' );
+
+		# update categories and tags
+		if( isset( $item->Category->name ) )
+			$this->sync_product_category( $post_id, $item->Category->name, apply_filters( 'wclsc_lightspeed_category_append', false ) );
+
+		if( isset( $item->Tags->tag ) )
+			$this->sync_product_tags( $post_id, $item->Tags->tag );
+
+		# TODO: Update Product Attributes
+
+		do_action( 'wclsc_sync_product', $post_id, $item );
+
+		$updated_product = apply_filters( 'wclsc_sync_product_data', $updated_product );
+
+		if( count( $updated_product ) > 1 )
+			wp_update_post( $updated_product );
+
+		return $post_id;
+	}
+
+	function sync_lightspeed_item_inventory( $item ){
+		if( ! is_object( $item ) )
+			return false;
+
+		if( ! $this->inventory_start_time )
+			$this->inventory_start_time = microtime( true );
+
+		if( $item->archived && $item->archived !== 'false' )
+			return true;
+
+		# check to see if a product exists with itemID meta
+		$post_id = $this->lightspeed->lookup_product_by_item_id( $item->itemID );
+
+		$sku_field = $this->lightspeed->api_settings['sku_field'];
+
+		# check to see if a product exists with SKU meta
+		if( ! $post_id && $sku_field && isset( $item->$sku_field ) && $item->$sku_field )
+			$post_id = $this->lightspeed->lookup_product_by_sku( $item->$sku_field );
+
+		# only sync inventory, do not create new items
+		if( ! $post_id )
+			return false;
+
+		# update QOH
+		$this->sync_qoh( $item, $post_id );
+
+		do_action( 'wclsc_sync_product_inventory', $post_id, $item );
+
+		return $post_id;
+	}
+
+	function sync_archived_lightspeed_item( $item ){
+		if( ! is_object( $item ) )
+			return false;
+
+		#if( ! $this->start_time )
+		#	$this->start_time = microtime( true );
+
+		if( $item->archived && $item->archived === 'true' ){
+
+			# check to see if a product exists with itemID meta
+			$post_id = $this->lightspeed->lookup_product_by_item_id( $item->itemID );
+
+			$sku_field = $this->lightspeed->api_settings['sku_field'];
+
+			# check to see if a product exists with SKU meta
+			if( ! $post_id && $sku_field && isset( $item->$sku_field ) && $item->$sku_field )
+				$post_id = $this->lightspeed->lookup_product_by_sku( $item->$sku_field );
+
+			# only trash products, do not create new items
+			if( ! $post_id )
+				return false;
+
+			# trash it
+			wp_trash_post( $post_id );
+			$this->trashed = true;
+
+			$this->debug_logger->add( 'wclsc', 'TRASH ARCHIVED ITEM: POST ID ' . $post_id . ' - ITEM ID ' . $item->itemID );
+
+			do_action( 'wclsc_sync_product_archived', $post_id, $item );
+
+			return $post_id;
+		}
+
+		return false;
+	}
+
+	function sync_qoh( $item, $post_id ){
+		$stock = $this->lightspeed->get_item_qoh( $item );
+
+		if( $stock || $stock === '0' ){
+			$previous_stock = get_post_meta( $post_id, '_stock', true );
+
+			if( $stock != $previous_stock ){
+				update_post_meta( $post_id, '_manage_stock', 'yes' );
+				update_post_meta( $post_id, '_stock', $stock );
+				if( $stock === '0' )
+					update_post_meta( $post_id, '_stock_status', 'outofstock' );
+				else
+					update_post_meta( $post_id, '_stock_status', 'instock' );
+
+				$this->log_product_data( $post_id, 'Modified Stock from ' . $previous_stock . ' to ' . $stock );
+			}
+		}
+	}
+
+	function get_sync_status( $sync_status = NULL ){
+		if( ! $sync_status )
+			$sync_status = get_transient( WCLSC_META_PREFIX . 'sync_status' );
+
+		if( ! $sync_status )
+			return false;
+
+		if( isset( $sync_status['offset'] ) && $sync_status['offset'] === 0 ){
+			$status = __( 'Querying first batch of records from LightSpeed.', 'wclsc' );
+		} else {
+			$status_text = isset( $sync_status['scheduled'] ) ? __( 'Paused on', 'wclsc' ) : __( 'Syncing', 'wclsc' );
+			$status = isset( $sync_status['offset'] ) && isset( $sync_status['total'] ) ? $status_text . ' Record ' . $sync_status['offset'] . ' of ' . $sync_status['total'] : __( 'Awaiting cron to start', 'wclsc' );
+		}
+
+		if( isset( $sync_status['completed'] ) )
+			$status = __( 'Completed Sync of ', 'wclsc' ) . $sync_status['total'] . __( ' records.', 'wclsc' );
+
+
+		$html = '<div class="sync-status">';
+			if( isset( $sync_status['started'] ) )
+				$html .= '<strong>Sync Started:</strong> ' . $sync_status['started'] . '<br />';
+			if( $status )
+				$html .= '<strong>Status:</strong> ' . $status . '<br />';
+			if( isset( $sync_status['scheduled'] ) && isset( $sync_status['offset'] ) && isset( $sync_status['total'] ) )
+				$html .= '<strong>Awaiting start of next batch</strong><br />';
+			if( isset( $sync_status['sync_amount'] ) )
+				$html .= '<strong>Amount Per Request:</strong> ' . $sync_status['sync_amount'] . '<br />';
+			#if( isset( $sync_status['execution_time'] ) )
+			#	$html .= '<strong>Time to Execute:</strong> ' . $sync_status['execution_time'] . '<br />';
+			if( isset( $sync_status['cancelled'] ) )
+				$html .= '<strong>Cancelled:</strong> ' . $sync_status['cancelled'] . '<br />';
+			if( isset( $sync_status['completed'] ) )
+				$html .= '<strong>Completed:</strong> ' . $sync_status['completed'] . '<br />';
+			#if( $full_time = wp_next_scheduled( WCLSC_OPT_PREFIX . 'recurring_sync_products' ) )
+			#	$html .= '<strong>Next Full Sync:</strong> ' . date( 'n/j/Y g:i a', $full_time ) . '<br />';
+			#if( $inventory_time = wp_next_scheduled( WCLSC_OPT_PREFIX . 'recurring_sync_product_inventory' ) )
+			#	$html .= '<strong>Next Inventory Sync:</strong> ' . date( 'n/j/Y g:i a', $inventory_time ) . '<br />';
+			#$html .= '<strong>Current Server Time:</strong> ' . date( 'n/j/Y g:i a', current_time( 'timestamp' ) ) . '<br />';
+			if( ! isset( $sync_status['completed'] ) && ! isset( $sync_status['cancelled'] ) )
+				$html .= '<input type="button" class="button wclsc-stop-sync" value="' . __( 'Stop Sync', 'wclsc' ) . '" />';
+		$html .= '</div>';
+
+		return $html;
+	}
+
+	function ajax_sync_status(){
+		$sync_status = get_transient( WCLSC_META_PREFIX . 'sync_status' );
+		$status = $this->get_sync_status( $sync_status );
+
+		$response = array(
+			'success' => true,
+			'html' => $status,
+			'status' => $sync_status
+		);
+
+		if( isset( $sync_status['completed'] ) && $sync_status['completed'] ){
+			$response['complete'] = '1';
+		}
+
+		wp_send_json( $response );
+	}
+
+	function ajax_stop_sync(){
+		set_transient( WCLSC_META_PREFIX . 'abort', '1' );
+		wp_clear_scheduled_hook( WCLSC_OPT_PREFIX . 'sync_products' );
+		$sync_status = get_transient( WCLSC_META_PREFIX . 'sync_status' );
+		$sync_status['cancelled'] = date( 'n/j/Y g:i a', current_time( 'timestamp' ) );
+		set_transient( WCLSC_META_PREFIX . 'sync_status', $sync_status );
+
+		$status = $this->get_sync_status( $sync_status );
+		$response = array(
+			'success' => true,
+			'html' => $status
+		);
+
+		wp_send_json( $response );
+	}
+
+	function trigger_cron(){
+
+		if( defined( 'DOING_AJAX' ) && DOING_AJAX ){
+
+			$sync_status = get_transient( WCLSC_META_PREFIX . 'sync_status' );
+
+			$json = array();
+
+			// Let's fire this every time to make sure it keeps running
+			if( ( ! isset( $sync_status['completed'] ) && ! isset( $sync_status['cancelled'] ) ) || ! isset( $sync_status['offset'] ) || ! isset( $sync_status['total'] ) ){
+				if( ! wp_schedule_event( WCLSC_OPT_PREFIX . 'sync_products' ) )
+					wp_schedule_single_event( current_time( 'timestamp' ), WCLSC_OPT_PREFIX . 'sync_products' );
+
+				wp_remote_get( site_url() . '/wp-cron.php?doing_wp_cron' );
+
+				$json['success'] = true;
+
+			}
+
+			wp_send_json( $json );
+		}
 	}
 }

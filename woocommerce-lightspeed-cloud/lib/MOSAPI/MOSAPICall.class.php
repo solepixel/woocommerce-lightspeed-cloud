@@ -22,6 +22,12 @@ class MOSAPICall {
 	 */
 	var $api_action;
 
+	/**
+	 * Last call to MerchantOS API
+	 * @var array
+	 */
+	var $last_call = array();
+
 	public function __construct( $api_key, $account_num )
 	{
 		$this->_api_key = $api_key;
@@ -81,12 +87,21 @@ class MOSAPICall {
 			$body = '';
 		}
 
+		$this->last_call = array(
+			'url' => $control_url,
+			'body' => $body
+		);
+
 		return self::_makeCall( $curl, $control_url, $body );
 	}
 
 	protected static function _makeCall( $curl, $url, $body )
 	{
-		$result = $curl->call( $url, $body );
+		try {
+			$result = $curl->call( $url, $body );
+		} catch( Exception $e ){
+			throw new Exception( 'MerchantOS API Call Error: ' . $e->getMessage() );
+		}
 
 		try {
 			$return = json_decode( $result );

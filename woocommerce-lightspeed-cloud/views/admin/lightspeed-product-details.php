@@ -1,6 +1,7 @@
 </div><!-- close reviews div -->
 
 <div class="lightspeed-product-details">
+	<div id="ls-product-sync"></div>
 	<div class="ls-product-log">
 		<strong><?php _e( 'LightSpeed Product Log', 'wclsc' ); ?>:</strong>
 		<div class="ls-product-log-data">
